@@ -1,0 +1,89 @@
+# GitHub Actions Magnet Link Seeding Bot
+# Place this file at: .github/workflows/seed-bot.yml
+#
+# This workflow runs every 4 hours, installs aria2c, downloads and seeds
+# the specified magnet link until the job times out (~4 hours).
+
+name: Seed Magnet Link
+
+on:
+  schedule:
+    # Every 4 hours: 0:00, 4:00, 8:00, 12:00, 16:00, 20:00 UTC
+    - cron: "0 */4 * * *"
+  workflow_dispatch: # Allows manual triggering from GitHub UI
+
+# Prevent concurrent runs — cancels the previous one if a new schedule kicks in
+concurrency:
+  group: seed-bot
+  cancel-in-progress: true
+
+jobs:
+  seed:
+    name: Download & Seed
+    runs-on: ubuntu-latest
+    timeout-minutes: 230 # ~3h 50m buffer so next cron doesn't overlap
+
+    steps:
+      - name: Install aria2c
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2
+
+      - name: Create download directory
+        run: mkdir -p ~/torrents
+
+      - name: Create aria2c configuration
+        run: |
+          cat > ~/aria2.conf << 'EOF'
+          # ── General ──────────────────────────────────────────
+          dir=/home/runner/torrents
+          continue=true
+          max-concurrent-downloads=5
+          max-connection-per-server=16
+          min-split-size=10M
+          split=16
+          max-tries=5
+          retry-wait=10
+          connect-timeout=60
+          timeout=300
+          # ── BitTorrent ──────────────────────────────────────
+          seed-ratio=0
+          seed-time=99999
+          seed-unverified=true
+          peer-id-prefix=-SD2300-
+          user-agent=qBittorrent/4.6.3
+          enable-dht=true
+          dht-listen-port=6881
+          bt-enable-lpd=true
+          enable-peer-exchange=true
+          # ── RPC (optional — for monitoring) ────────────────
+          enable-rpc=true
+          rpc-listen-all=false
+          rpc-listen-port=6800
+          # ── Logging ─────────────────────────────────────────
+          log=/home/runner/torrents/aria2.log
+          log-level=notice
+          EOF
+
+      - name: Download & Seed magnet link
+        run: |
+          MAGNET='magnet:?xt=urn:btih:414c58ffafcf782396e44f8528ed838ea4714ee8&dn=%5BDCPN%5D%20Detective%20Conan%20-%20Movie%204%20-%20Captured%20In%20Her%20Eye%20-%20Funimation%20Dub%20Remastered%20x265%20BD%20Encode.mkv%20%7BTags%3AV13%3BC2%3BA%3Den%3B%7D&tr=https%3A%2F%2Ftracker.nekobt.to%2Fapi%2Ftracker%2Fpublic%2Fannounce&tr=http%3A%2F%2Fnyaa.tracker.wf%3A7777%2Fannounce&ws=https%3A%2F%2Frd3.seedr.cc%2Fff_get%2F5932549471%2F%5BDCPN%5D%2520Detective%2520Conan%2520-%2520Magic%2520File%25206%2520%5B480p%2520AVC%2520MP3%5D%5B3B7D2F9A%5D.mkv%3Fst%3DEcv1Wqc8O6s0fyw5GY7-Zg%26e%3D1780792742'
+
+          echo ">>> Starting aria2c — will seed until timeout kicks in..."
+          echo ">>> Magnet info hash: 414c58ffafcf782396e44f8528ed838ea4714ee8"
+
+          # Launch aria2c; it will block until the job timeout kills it.
+          # --seed-ratio=0 + --seed-time=99999 means it seeds indefinitely.
+          aria2c \
+            --conf-path=/home/runner/aria2.conf \
+            "${MAGNET}"
+
+      # Optional: log some stats before the runner shuts down
+      - name: Log seeding stats
+        if: always()
+        run: |
+          echo "=== aria2 log (last 50 lines) ==="
+          tail -n 50 ~/torrents/aria2.log 2>/dev/null || echo "(no log found)"
+          echo ""
+          echo "=== Downloaded files ==="
+          ls -lh ~/torrents/ 2>/dev/null || echo "(no files found)"
