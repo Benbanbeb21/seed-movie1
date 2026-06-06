@@ -1,10 +1,11 @@
-# GitHub Actions Magnet Link Seeding Bot
+# GitHub Actions Magnet Link Seeding Bot (updated)
 # Place this file at: .github/workflows/seed-bot.yml
 #
-# This workflow runs every 4 hours, installs aria2c, downloads and seeds
-# the specified magnet link until the job times out (~4 hours).
+# This workflow runs every 4 hours, installs aria2c and mktorrent,
+# downloads the specified direct HTTP file, creates a .torrent from it,
+# and then seeds that torrent until the job times out (~3h50m).
 
-name: Seed Magnet Link
+name: Seed File and Create Torrent
 
 on:
   schedule:
@@ -12,22 +13,21 @@ on:
     - cron: "0 */4 * * *"
   workflow_dispatch: # Allows manual triggering from GitHub UI
 
-# Prevent concurrent runs — cancels the previous one if a new schedule kicks in
 concurrency:
   group: seed-bot
   cancel-in-progress: true
 
 jobs:
   seed:
-    name: Download & Seed
+    name: Download, Create Torrent & Seed
     runs-on: ubuntu-latest
     timeout-minutes: 230 # ~3h 50m buffer so next cron doesn't overlap
 
     steps:
-      - name: Install aria2c
+      - name: Install dependencies (aria2, mktorrent)
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2
+          sudo apt-get install -y aria2 mktorrent
 
       - name: Create download directory
         run: mkdir -p ~/torrents
@@ -65,20 +65,42 @@ jobs:
           log-level=notice
           EOF
 
-      - name: Download & Seed magnet link
+      - name: Download file via HTTP
         run: |
-          MAGNET='magnet:?xt=urn:btih:414c58ffafcf782396e44f8528ed838ea4714ee8&dn=%5BDCPN%5D%20Detective%20Conan%20-%20Movie%204%20-%20Captured%20In%20Her%20Eye%20-%20Funimation%20Dub%20Remastered%20x265%20BD%20Encode.mkv%20%7BTags%3AV13%3BC2%3BA%3Den%3B%7D&tr=https%3A%2F%2Ftracker.nekobt.to%2Fapi%2Ftracker%2Fpublic%2Fannounce&tr=http%3A%2F%2Fnyaa.tracker.wf%3A7777%2Fannounce&ws=https%3A%2F%2Frd3.seedr.cc%2Fff_get%2F5932549471%2F%5BDCPN%5D%2520Detective%2520Conan%2520-%2520Magic%2520File%25206%2520%5B480p%2520AVC%2520MP3%5D%5B3B7D2F9A%5D.mkv%3Fst%3DEcv1Wqc8O6s0fyw5GY7-Zg%26e%3D1780792742'
+          # The direct download URL (wrapped in quotes because it contains special characters)
+          FILE_URL='https://rd3.seedr.cc/ff_get/5932549471/[DCPN]%20Detective%20Conan%20-%20Magic%20File%206%20[480p%20AVC%20MP3][3B7D2F9A].mkv?st=Ecv1Wqc8O6s0fyw5GY7-Zg&e=1780792742'
 
-          echo ">>> Starting aria2c — will seed until timeout kicks in..."
-          echo ">>> Magnet info hash: 414c58ffafcf782396e44f8528ed838ea4714ee8"
+          # Choose a safe filename to write the download as (avoid ? and query params)
+          OUTNAME='[DCPN] Detective Conan - Magic File 6 [480p AVC MP3][3B7D2F9A].mkv'
 
-          # Launch aria2c; it will block until the job timeout kills it.
-          # --seed-ratio=0 + --seed-time=99999 means it seeds indefinitely.
-          aria2c \
-            --conf-path=/home/runner/aria2.conf \
-            "${MAGNET}"
+          echo "Downloading to ~/torrents/${OUTNAME} ..."
 
-      # Optional: log some stats before the runner shuts down
+          # Use aria2c for the HTTP download (resume capable, fast connections)
+          aria2c -d /home/runner/torrents -o "${OUTNAME}" -x16 -s16 --allow-overwrite=true "${FILE_URL}"
+
+      - name: Create torrent from downloaded file
+        run: |
+          FILEPATH=/home/runner/torrents/[DCPN]\\ Detective\\ Conan\\ -\\ Magic\\ File\\ 6\\ \\[480p\\ AVC\\ MP3\\]\\[3B7D2F9A\\].mkv
+          TORRENT_OUT=/home/runner/torrents/magic-file-6.torrent
+
+          echo "Creating torrent ${TORRENT_OUT} from ${FILEPATH}"
+
+          # Public tracker list (multiple -a flags)
+          mktorrent \
+            -a "udp://tracker.openbittorrent.com:80/announce" \
+            -a "udp://tracker.opentrackr.org:1337/announce" \
+            -a "udp://tracker.leechers-paradise.org:6969/announce" \
+            -a "udp://tracker.coppersurfer.tk:6969/announce" \
+            -o "${TORRENT_OUT}" "${FILEPATH}"
+
+          echo "Torrent created: ${TORRENT_OUT}"
+
+      - name: Seed torrent (blocks until job timeout)
+        run: |
+          # Start aria2c with the .torrent file — aria2.conf sets seed-ratio=0 and seed-time=99999
+          echo "Starting aria2c to seed the torrent (will run until job timeout)..."
+          aria2c --conf-path=/home/runner/aria2.conf /home/runner/torrents/magic-file-6.torrent
+
       - name: Log seeding stats
         if: always()
         run: |
