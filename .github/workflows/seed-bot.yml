@@ -1,17 +1,11 @@
-# GitHub Actions Magnet Link Seeding Bot (updated)
-# Place this file at: .github/workflows/seed-bot.yml
-#
-# This workflow runs every 4 hours, installs aria2c and mktorrent,
-# downloads the specified direct HTTP file, creates a .torrent from it,
-# and then seeds that torrent until the job times out (~3h50m).
+# GitHub Actions: Download HTTP file, create torrent and seed; fallback to magnet if URL unavailable.
 
 name: Seed File and Create Torrent
 
 on:
   schedule:
-    # Every 4 hours: 0:00, 4:00, 8:00, 12:00, 16:00, 20:00 UTC
     - cron: "0 */4 * * *"
-  workflow_dispatch: # Allows manual triggering from GitHub UI
+  workflow_dispatch:
 
 concurrency:
   group: seed-bot
@@ -19,23 +13,22 @@ concurrency:
 
 jobs:
   seed:
-    name: Download, Create Torrent & Seed
+    name: Download, Create Torrent & Seed (with fallback)
     runs-on: ubuntu-latest
-    timeout-minutes: 230 # ~3h 50m buffer so next cron doesn't overlap
+    timeout-minutes: 230
 
     steps:
-      - name: Install dependencies (aria2, mktorrent)
+      - name: Install dependencies (aria2, mktorrent, curl)
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 mktorrent
+          sudo apt-get install -y aria2 mktorrent curl
 
       - name: Create download directory
-        run: mkdir -p ~/torrents
+        run: mkdir -p /home/runner/torrents
 
       - name: Create aria2c configuration
         run: |
-          cat > ~/aria2.conf << 'EOF'
-          # ── General ──────────────────────────────────────────
+          cat > /home/runner/aria2.conf << 'EOF'
           dir=/home/runner/torrents
           continue=true
           max-concurrent-downloads=5
@@ -46,7 +39,6 @@ jobs:
           retry-wait=10
           connect-timeout=60
           timeout=300
-          # ── BitTorrent ──────────────────────────────────────
           seed-ratio=0
           seed-time=99999
           seed-unverified=true
@@ -56,56 +48,56 @@ jobs:
           dht-listen-port=6881
           bt-enable-lpd=true
           enable-peer-exchange=true
-          # ── RPC (optional — for monitoring) ────────────────
           enable-rpc=true
           rpc-listen-all=false
           rpc-listen-port=6800
-          # ── Logging ─────────────────────────────────────────
           log=/home/runner/torrents/aria2.log
           log-level=notice
           EOF
 
-      - name: Download file via HTTP
+      - name: Download via HTTP (or fallback to magnet)
         run: |
-          # The direct download URL (wrapped in quotes because it contains special characters)
+          set -euo pipefail
+
           FILE_URL='https://rd3.seedr.cc/ff_get/5932549471/[DCPN]%20Detective%20Conan%20-%20Magic%20File%206%20[480p%20AVC%20MP3][3B7D2F9A].mkv?st=Ecv1Wqc8O6s0fyw5GY7-Zg&e=1780792742'
-
-          # Choose a safe filename to write the download as (avoid ? and query params)
           OUTNAME='[DCPN] Detective Conan - Magic File 6 [480p AVC MP3][3B7D2F9A].mkv'
+          OUTPATH="/home/runner/torrents/${OUTNAME}"
+          MAGNET='magnet:?xt=urn:btih:414c58ffafcf782396e44f8528ed838ea4714ee8'
 
-          echo "Downloading to ~/torrents/${OUTNAME} ..."
+          echo "Checking HTTP URL status..."
+          status=$(curl -s -o /dev/null -w "%{http_code}" -L --max-time 20 "${FILE_URL}" || echo "000")
+          echo "HTTP status: ${status}"
 
-          # Use aria2c for the HTTP download (resume capable, fast connections)
-          aria2c -d /home/runner/torrents -o "${OUTNAME}" -x16 -s16 --allow-overwrite=true "${FILE_URL}"
-
-      - name: Create torrent from downloaded file
-        run: |
-          FILEPATH=/home/runner/torrents/[DCPN]\\ Detective\\ Conan\\ -\\ Magic\\ File\\ 6\\ \\[480p\\ AVC\\ MP3\\]\\[3B7D2F9A\\].mkv
-          TORRENT_OUT=/home/runner/torrents/magic-file-6.torrent
-
-          echo "Creating torrent ${TORRENT_OUT} from ${FILEPATH}"
-
-          # Public tracker list (multiple -a flags)
-          mktorrent \
-            -a "udp://tracker.openbittorrent.com:80/announce" \
-            -a "udp://tracker.opentrackr.org:1337/announce" \
-            -a "udp://tracker.leechers-paradise.org:6969/announce" \
-            -a "udp://tracker.coppersurfer.tk:6969/announce" \
-            -o "${TORRENT_OUT}" "${FILEPATH}"
-
-          echo "Torrent created: ${TORRENT_OUT}"
-
-      - name: Seed torrent (blocks until job timeout)
-        run: |
-          # Start aria2c with the .torrent file — aria2.conf sets seed-ratio=0 and seed-time=99999
-          echo "Starting aria2c to seed the torrent (will run until job timeout)..."
-          aria2c --conf-path=/home/runner/aria2.conf /home/runner/torrents/magic-file-6.torrent
+          if [ "${status}" = "200" ]; then
+            echo "HTTP file available — downloading with aria2c..."
+            aria2c -d /home/runner/torrents -o "${OUTNAME}" -x16 -s16 --allow-overwrite=true "${FILE_URL}"
+            rc=$? || rc=$?
+            if [ "${rc}" -ne 0 ]; then
+              echo "aria2c reported exit code ${rc} while downloading HTTP file; falling back to magnet."
+              echo "Starting aria2c with magnet..."
+              aria2c --conf-path=/home/runner/aria2.conf "${MAGNET}"
+            else
+              echo "Download completed via HTTP: ${OUTPATH}"
+              echo "Proceeding to create a .torrent from the file..."
+              mktorrent -a "udp://tracker.openbittorrent.com:80/announce" \
+                        -a "udp://tracker.opentrackr.org:1337/announce" \
+                        -a "udp://tracker.leechers-paradise.org:6969/announce" \
+                        -a "udp://tracker.coppersurfer.tk:6969/announce" \
+                        -o "/home/runner/torrents/magic-file-6.torrent" "${OUTPATH}"
+              echo "Starting aria2c to seed the created .torrent..."
+              aria2c --conf-path=/home/runner/aria2.conf "/home/runner/torrents/magic-file-6.torrent"
+            fi
+          else
+            echo "HTTP file not available (status ${status}); falling back to magnet..."
+            echo "Magnet: ${MAGNET}"
+            aria2c --conf-path=/home/runner/aria2.conf "${MAGNET}"
+          fi
 
       - name: Log seeding stats
         if: always()
         run: |
           echo "=== aria2 log (last 50 lines) ==="
-          tail -n 50 ~/torrents/aria2.log 2>/dev/null || echo "(no log found)"
+          tail -n 50 /home/runner/torrents/aria2.log 2>/dev/null || echo "(no log found)"
           echo ""
           echo "=== Downloaded files ==="
-          ls -lh ~/torrents/ 2>/dev/null || echo "(no files found)"
+          ls -lh /home/runner/torrents/ 2>/dev/null || echo "(no files found)"
